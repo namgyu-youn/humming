@@ -11,7 +11,7 @@
 
 template <class Config, class ScaleType>
 CUDA_INLINE uint64_t group_scale_index(uint64_t output_row, uint32_t group, uint64_t scale_stride) {
-  constexpr uint64_t kGroupsPerToken = Config::kHiddenSize / Config::kQuantGroupSize;
+  constexpr uint64_t kGroupsPerToken = CEIL_DIV(Config::kHiddenSize, Config::kQuantGroupSize);
   if constexpr (std::is_same<ScaleType, M3BFloat16>::value) {
     return output_row * kGroupsPerToken + group;
   } else if constexpr (!Config::kUseMMajorInputScale) {
@@ -22,6 +22,24 @@ CUDA_INLINE uint64_t group_scale_index(uint64_t output_row, uint32_t group, uint
   } else {
     static_assert(std::is_same<ScaleType, Float8E4M3>::value || std::is_same<ScaleType, Float8E8M0>::value);
     return (group / 4) * (scale_stride * 4) + output_row * 4 + group % 4;
+  }
+}
+
+
+// 8-bit group scales are packed four per 32-bit word, so a row whose group count is not a multiple
+// of four ends in unused groups. GEMMs read whole words and pad K past the real groups, so these
+// groups must hold a finite scale: zero them instead of leaving uninitialized (possibly NaN) bytes.
+template <class Config, class ScaleType>
+CUDA_INLINE void clear_packed_group_scale_padding(void *scales, uint64_t output_row, uint64_t scale_stride) {
+  constexpr uint32_t kGroupsPerToken = CEIL_DIV(Config::kHiddenSize, Config::kQuantGroupSize);
+  constexpr uint32_t kPackedGroupsPerToken = (kGroupsPerToken + 3) / 4 * 4;
+  constexpr bool kPacked = std::is_same<ScaleType, Float8E4M3>::value || std::is_same<ScaleType, Float8E8M0>::value;
+  if constexpr (kPacked && kPackedGroupsPerToken > kGroupsPerToken) {
+    PRAGMA_UNROLL
+    for (uint32_t group = kGroupsPerToken; group < kPackedGroupsPerToken; group++) {
+      uint64_t index = group_scale_index<Config, ScaleType>(output_row, group, scale_stride);
+      store_scale<ScaleType>(scales, index, ScaleStorage<ScaleType>{});
+    }
   }
 }
 
@@ -70,7 +88,11 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
 
   static_assert(kThreads >= 32 && kThreads <= 1024 && kThreads % 32 == 0);
   static_assert(Config::kUseTilePartition || Config::kThreadsPerTask * V >= K);
-  static_assert(K % G == 0 && G % V == 0);
+  // The last group may be partial: inactive columns read as zero, so it is
+  // scaled by its real values only.
+  static_assert(G % V == 0);
+  static_assert(Config::kUseTilePartition || !Config::kDynamicGroupScale ||
+                Config::kThreadsPerTask * V >= CEIL_DIV(K, G) * G);
   static_assert(V >= 1 && (V & (V - 1)) == 0);
   static_assert(!Config::kQuantize || V * TargetType::kBits % 8 == 0);
   if constexpr (Config::kHadamard) {
@@ -178,6 +200,10 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
               }
               ScaleStorage<OutputScaleType> stored_scale = write.zero_output() ? ScaleStorage<OutputScaleType>{} : group_output_scale;
               store_scale<OutputScaleType>(output_scales, scale_index, stored_scale);
+              if constexpr (Config::kDynamicGroupScale) {
+                if (group == CEIL_DIV(K, G) - 1)
+                  clear_packed_group_scale_padding<Config, OutputScaleType>(output_scales, write.output_row, group_scale_stride);
+              }
             }
             if constexpr (Config::kFusedGroupToken)
               if (thread.input_col == 0) token_scales[write.output_row] = write.zero_output() ? 0.f : token_scale;
@@ -225,7 +251,7 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
     bool use_int64_num_valid_tokens) {
   using Config = ProcessInputContext<BaseConfig, TuningConfig, ProcessInputQuantizationPhase::Fused, true>;
   using OutputScaleType = typename Config::ConfiguredDynamicGroupScaleType;
-  constexpr uint32_t kGroupsPerToken = Config::kHiddenSize / Config::kQuantGroupSize;
+  constexpr uint32_t kGroupsPerToken = CEIL_DIV(Config::kHiddenSize, Config::kQuantGroupSize);
   static_assert(Config::kStagedGroupToken);
   static_assert(kTokensPerBlock == Config::kTokensPerBlock && kTokensPerBlock <= 32);
   if constexpr (Config::kUsePdl) griddepcontrol_wait();
@@ -264,6 +290,8 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
         uint64_t index = group_scale_index<Config, OutputScaleType>(task.output_row, group, group_scale_stride);
         store_scale<OutputScaleType>(output_scales, index, encode_scale<OutputScaleType>(scale));
       }
+      if (lane == 0)
+        clear_packed_group_scale_padding<Config, OutputScaleType>(output_scales, task.output_row, group_scale_stride);
     }
   }
   if constexpr (Config::kUsePdl) {
